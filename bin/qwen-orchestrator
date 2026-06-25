@@ -28,12 +28,12 @@ QWEN_DIR = HOME / ".qwen"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 ERROR_RE = re.compile(r"request timeout|api error|timeout|rate limit|overloaded|try reducing", re.I)
 HISTORY_ERROR_RE = re.compile(r"system message must be at the beginning", re.I)
-DONE_RE = re.compile(
-    r"complete|completed|done|final|pushed|pusheado|sincronizado|everything up-to-date|"
-    r"created pull request|opened.*pr|merged|todo completado|tareas completadas|checks pass|"
-    r"all checks.*pass|ya estaba sincronizado",
-    re.I,
+DEFAULT_COMPLETION_PATTERN = (
+    r"\b(?:complete|completed|done|final|pushed|pusheado|sincronizado|merged)\b|"
+    r"everything up-to-date|created pull request|opened.*\bpr\b|todo completado|"
+    r"tareas completadas|checks pass|all checks.*pass|ya estaba sincronizado"
 )
+DEFAULT_USER_COMPLETION_PATTERN = r"\s*(ok\s*)?fin\s*"
 SECRET_RE = re.compile(
     r"(sk-[A-Za-z0-9_-]+|gh[opsu]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|Bearer\s+[A-Za-z0-9._-]+)",
     re.I,
@@ -121,6 +121,20 @@ def cfg_get(cfg: dict[str, Any], path: str, default: Any = None) -> Any:
     return cur
 
 
+def cfg_regex(cfg: dict[str, Any], path: str, default: str) -> re.Pattern[str] | None:
+    pattern = str(cfg_get(cfg, path, default) or "")
+    if not pattern:
+        return None
+    try:
+        return re.compile(pattern, re.I | re.S)
+    except re.error as exc:
+        log(f"invalid regex at {path}: {exc}; using default")
+        try:
+            return re.compile(default, re.I | re.S)
+        except re.error:
+            return None
+
+
 def load_config() -> dict[str, Any]:
     cfg = load_simple_yaml(DEFAULT_CONFIG)
     if USER_CONFIG.exists():
@@ -170,6 +184,14 @@ class SessionCandidate:
     running: QwenProcess | None
     input_file: str | None
     mtime: float
+
+
+@dataclass
+class ChatSummary:
+    reason: str
+    last_user: str
+    last_assistant: str
+    last_interaction_role: str
 
 
 def project_key_from_cwd(cwd: str) -> str:
@@ -278,10 +300,11 @@ def text_from_event(ev: dict[str, Any]) -> str:
     return redact_text(" ".join(t.replace("\n", " ") for t in texts).strip())
 
 
-def summarize_chat(path: Path, stale_minutes: int) -> tuple[str, str, str]:
+def summarize_chat(path: Path, stale_minutes: int, cfg: dict[str, Any]) -> ChatSummary:
     events = read_recent_jsonl(path)
     last_user = ""
     last_assistant = ""
+    last_interaction_role = ""
     combined_recent: list[str] = []
     for ev in events:
         text = text_from_event(ev)
@@ -292,21 +315,30 @@ def summarize_chat(path: Path, stale_minutes: int) -> tuple[str, str, str]:
         role = ev.get("message", {}).get("role")
         if typ == "user" or role == "user":
             last_user = text[:500]
+            last_interaction_role = "user"
         if typ == "assistant" or role in {"assistant", "model"}:
             last_assistant = text[:500]
+            last_interaction_role = "assistant"
     recent_tail = "\n".join(combined_recent[-4:])
     age_min = (time.time() - path.stat().st_mtime) / 60
-    if DONE_RE.search(last_assistant) or re.fullmatch(r"(?i)\s*(ok\s*)?fin\s*", last_user or ""):
-        reason = "active-or-complete"
+    completion_enabled = bool(cfg_get(cfg, "qwen.completion_detection_enabled", True))
+    completion_re = cfg_regex(cfg, "qwen.completion_regex", DEFAULT_COMPLETION_PATTERN)
+    user_completion_re = cfg_regex(cfg, "qwen.user_completion_regex", DEFAULT_USER_COMPLETION_PATTERN)
+    resume_after_assistant = bool(cfg_get(cfg, "qwen.resume_after_assistant_response", False))
+    if completion_enabled and (
+        (completion_re and completion_re.search(last_assistant))
+        or (user_completion_re and user_completion_re.fullmatch(last_user or ""))
+    ):
+        reason = "completed"
     elif HISTORY_ERROR_RE.search(recent_tail):
         reason = "resume history incompatible"
     elif ERROR_RE.search(recent_tail):
         reason = "recent API/timeout error"
-    elif age_min >= stale_minutes and last_user and not DONE_RE.search(last_assistant):
+    elif age_min >= stale_minutes and last_user and (last_interaction_role == "user" or resume_after_assistant):
         reason = f"stale {int(age_min)}m after user request"
     else:
         reason = "active-or-complete"
-    return reason, last_user, last_assistant
+    return ChatSummary(reason, last_user, last_assistant, last_interaction_role)
 
 
 def discover_sessions(cfg: dict[str, Any], include_all_recent: bool = False) -> list[SessionCandidate]:
@@ -330,12 +362,25 @@ def discover_sessions(cfg: dict[str, Any], include_all_recent: bool = False) -> 
             paths.setdefault(path.stem, path)
     out: list[SessionCandidate] = []
     for sid, path in paths.items():
-        reason, last_user, last_assistant = summarize_chat(path, stale)
+        summary = summarize_chat(path, stale, cfg)
         proc = by_sid.get(sid)
-        if include_all_recent or proc or reason != "active-or-complete":
+        if include_all_recent or proc or summary.reason not in {"active-or-complete", "completed"}:
             project_dir = path.parents[1]
             cwd = proc.cwd if proc and proc.cwd else cwd_from_project_key(project_dir.name)
-            out.append(SessionCandidate(sid, path, project_dir, cwd, reason, last_user, last_assistant, proc, proc.input_file if proc else None, path.stat().st_mtime))
+            out.append(
+                SessionCandidate(
+                    sid,
+                    path,
+                    project_dir,
+                    cwd,
+                    summary.reason,
+                    summary.last_user,
+                    summary.last_assistant,
+                    proc,
+                    proc.input_file if proc else None,
+                    path.stat().st_mtime,
+                )
+            )
     return sorted(out, key=lambda s: (s.reason == "active-or-complete", -s.mtime))
 
 
@@ -496,7 +541,7 @@ def round_robin(cfg: dict[str, Any], force: bool, dry_run: bool) -> list[str]:
     restart_running = bool(cfg_get(cfg, "qwen.restart_running_without_input_file", False))
     candidates = []
     for session in discover_sessions(cfg, include_all_recent=True):
-        if session.reason == "active-or-complete":
+        if session.reason in {"active-or-complete", "completed"}:
             continue
         if session.running and not session.input_file and not restart_running:
             continue

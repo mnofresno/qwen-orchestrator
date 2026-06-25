@@ -37,7 +37,6 @@ esac
 CONFIG_DIR="$HOME/.config/qwen-orchestrator"
 CONFIG_SRC="$REPO_ROOT/config/config.example.yaml"
 BINARY="$REPO_ROOT/bin/qwen-orchestrator"
-SERVICE_SRC="$REPO_ROOT/service/qwen-orchestrator.service"
 
 # ---------------------------------------------------------------------------
 # Flag parsing
@@ -73,11 +72,29 @@ make_executable() {
 # Linux: systemd user service
 # ---------------------------------------------------------------------------
 install_systemd() {
-    mkdir -p "$HOME/.config/systemd/user"
-    cp "$SERVICE_SRC" "$HOME/.config/systemd/user/qwen-orchestrator.service"
+    local service_dir="$HOME/.config/systemd/user"
+    local service="$service_dir/qwen-orchestrator.service"
+    mkdir -p "$service_dir"
+    cat > "$service" <<SERVICE
+[Unit]
+Description=Qwen Orchestrator - GPU monitor and session resume service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$BINARY
+Restart=on-failure
+RestartSec=10
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+SERVICE
     systemctl --user daemon-reload
-    systemctl --user enable qwen-orchestrator
-    echo "==> systemd: service enabled (run 'systemctl --user start qwen-orchestrator')"
+    systemctl --user enable --now qwen-orchestrator
+    echo "==> systemd: installed, enabled, and started $service"
 }
 
 # ---------------------------------------------------------------------------
@@ -143,6 +160,7 @@ case "$ACTION" in
         if [ "$PLATFORM" = "linux" ]; then
             systemctl --user start qwen-orchestrator
         else
+            launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.mnofresno.qwen-orchestrator.plist" 2>/dev/null || true
             launchctl kickstart -k "gui/$(id -u)/com.mnofresno.qwen-orchestrator"
         fi
         ;;
@@ -152,7 +170,7 @@ case "$ACTION" in
         if [ "$PLATFORM" = "linux" ]; then
             systemctl --user stop qwen-orchestrator
         else
-            launchctl kill TERM "gui/$(id -u)/com.mnofresno.qwen-orchestrator" 2>/dev/null || true
+            launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.mnofresno.qwen-orchestrator.plist" 2>/dev/null || true
         fi
         ;;
 

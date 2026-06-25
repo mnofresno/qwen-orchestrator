@@ -47,6 +47,13 @@ qwen:
   launch_terminal_on_macos: true
   restart_running_without_input_file: false
   fresh_on_history_error: true
+  completion_detection_enabled: true
+  completion_regex: "\b(?:complete|completed|done|final|pushed|pusheado|sincronizado|merged)\b|everything up-to-date|created pull request|opened.*\bpr\b|todo completado|tareas completadas|checks pass|all checks.*pass|ya estaba sincronizado"
+  user_completion_regex: \s*(ok\s*)?fin\s*
+  # false means age-based resume only applies when the last relevant chat turn
+  # is from the user. Set true to preserve the older behavior of retrying old
+  # sessions even after an assistant response that did not match completion_regex.
+  resume_after_assistant_response: false
   dry_run: false
 
 # --- Auto-push config changes to this repo ---

@@ -5,7 +5,7 @@ Cross-platform user-level service (macOS / Linux) that monitors GPU/Grafana load
 ## Features
 
 - **Multi-strategy load detection** — choose between SSH/nvidia-smi, Grafana API (LLM gateway slots, GPU power), or both
-- **Smart error detection** — scans running and recent Qwen Code sessions for timeout/API errors or stale user requests
+- **Smart error detection** — scans running and recent Qwen Code sessions for timeout/API errors, stale unanswered user requests, and completed work
 - **Round-robin control** — resumes one configurable session per cycle so the GPU stays busy without stampeding the server
 - **Configurable resume message** — asks resumed agents to continue, validate, commit, and push when appropriate
 - **User-level service** — `systemctl --user` on Linux, `launchd` on macOS
@@ -32,6 +32,10 @@ Then edit `~/.config/qwen-orchestrator/config.yaml` and restart:
 systemctl --user restart qwen-orchestrator    # Linux
 launchctl kickstart -k gui/$(id -u)/com.mnofresno.qwen-orchestrator  # macOS
 ```
+
+The installer creates a user-level service on both platforms. On Linux it writes
+`~/.config/systemd/user/qwen-orchestrator.service`, runs `systemctl --user enable
+--now qwen-orchestrator`, and points `ExecStart` at the checked-out binary.
 
 ## Manual Usage
 
@@ -61,6 +65,22 @@ Qwen Code accepts remote commands through `--input-file`. The orchestrator write
 ```
 
 Sessions that were already launched with `--input-file` can be controlled directly. Older sessions without that flag are relaunched with `qwen --resume <session> --input-file <file>`; on macOS that happens in Terminal so Qwen still has a real TTY.
+
+The round-robin loop intentionally avoids relaunching completed or already
+answered sessions. By default, age-based resume only applies when the latest
+relevant chat turn is still a user request. Completion detection is configurable:
+
+```yaml
+qwen:
+  completion_detection_enabled: true
+  completion_regex: "complete|completed|done|pushed|created pull request|merged"
+  user_completion_regex: \s*(ok\s*)?fin\s*
+  resume_after_assistant_response: false
+```
+
+Set `resume_after_assistant_response: true` only if you want the older aggressive
+behavior where old sessions can be retried even after an assistant response that
+did not match `completion_regex`.
 
 ## Config
 
