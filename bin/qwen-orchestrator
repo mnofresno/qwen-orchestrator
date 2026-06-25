@@ -27,6 +27,7 @@ STATE_FILE = DATA_DIR / "state.json"
 QWEN_DIR = HOME / ".qwen"
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 ERROR_RE = re.compile(r"request timeout|api error|timeout|rate limit|overloaded|try reducing", re.I)
+HISTORY_ERROR_RE = re.compile(r"system message must be at the beginning", re.I)
 DONE_RE = re.compile(
     r"complete|completed|done|final|pushed|pusheado|sincronizado|everything up-to-date|"
     r"created pull request|opened.*pr|merged|todo completado|tareas completadas|checks pass|"
@@ -270,6 +271,10 @@ def text_from_event(ev: dict[str, Any]) -> str:
                 resp = part.get("functionResponse", {}).get("response", {})
                 if isinstance(resp, dict) and isinstance(resp.get("output"), str):
                     texts.append(resp["output"])
+    ui_event = ev.get("systemPayload", {}).get("uiEvent", {})
+    for key in ("error_message", "response_text"):
+        if isinstance(ui_event.get(key), str):
+            texts.append(ui_event[key])
     return redact_text(" ".join(t.replace("\n", " ") for t in texts).strip())
 
 
@@ -293,6 +298,8 @@ def summarize_chat(path: Path, stale_minutes: int) -> tuple[str, str, str]:
     age_min = (time.time() - path.stat().st_mtime) / 60
     if DONE_RE.search(last_assistant) or re.fullmatch(r"(?i)\s*(ok\s*)?fin\s*", last_user or ""):
         reason = "active-or-complete"
+    elif HISTORY_ERROR_RE.search(recent_tail):
+        reason = "resume history incompatible"
     elif ERROR_RE.search(recent_tail):
         reason = "recent API/timeout error"
     elif age_min >= stale_minutes and last_user and not DONE_RE.search(last_assistant):
@@ -396,24 +403,34 @@ def shell_quote_cmd(parts: list[str]) -> str:
     return " ".join(shlex.quote(p) for p in parts)
 
 
-def launch_qwen(candidate: SessionCandidate, cfg: dict[str, Any], dry_run: bool) -> tuple[bool, str, Path]:
+def launch_qwen(candidate: SessionCandidate, cfg: dict[str, Any], dry_run: bool, fresh: bool = False) -> tuple[bool, str, Path]:
     input_dir = expand_path(cfg_get(cfg, "qwen.input_dir", str(INPUT_DIR_DEFAULT)))
-    input_file = input_dir / f"{candidate.session_id}.jsonl"
+    if fresh:
+        input_file = input_dir / f"{candidate.session_id}.fresh.{int(time.time())}.jsonl"
+    else:
+        input_file = input_dir / f"{candidate.session_id}.jsonl"
     qwen_cmd = str(expand_path(cfg_get(cfg, "qwen.command", str(HOME / ".local" / "bin" / "qwen"))))
-    args = [qwen_cmd, "--resume", candidate.session_id, "--input-file", str(input_file)]
+    qwen_real_bin = cfg_get(cfg, "qwen.real_bin", "")
+    args = [qwen_cmd]
+    if not fresh:
+        args.extend(["--resume", candidate.session_id])
+    args.extend(["--input-file", str(input_file)])
     if bool(cfg_get(cfg, "qwen.yolo", True)):
         args.append("--yolo")
     cwd = candidate.cwd if Path(candidate.cwd).exists() else str(HOME)
     if dry_run:
-        return True, f"dry-run launch: cd {cwd} && {shell_quote_cmd(args)}", input_file
+        mode = "fresh" if fresh else "resume"
+        return True, f"dry-run {mode} launch: cd {cwd} && {shell_quote_cmd(args)}", input_file
     input_file.parent.mkdir(parents=True, exist_ok=True)
     input_file.touch(exist_ok=True)
     if platform.system() == "Darwin" and bool(cfg_get(cfg, "qwen.launch_terminal_on_macos", True)):
         launch_dir = DATA_DIR / "launch"
         launch_dir.mkdir(parents=True, exist_ok=True)
         command_file = launch_dir / f"{candidate.session_id}.command"
+        real_bin_export = f"export QWEN_REAL_BIN={shlex.quote(str(expand_path(qwen_real_bin)))}\n" if qwen_real_bin else ""
         command_file.write_text(
             "#!/bin/zsh\n"
+            f"{real_bin_export}"
             f"cd {shlex.quote(cwd)}\n"
             f"exec {shell_quote_cmd(args)}\n",
             encoding="utf-8",
@@ -422,24 +439,50 @@ def launch_qwen(candidate: SessionCandidate, cfg: dict[str, Any], dry_run: bool)
         proc = run(["open", "-a", "Terminal", str(command_file)], timeout=15)
         if proc.returncode != 0:
             return False, f"Terminal launch failed: {proc.stderr.strip()}", input_file
-        return True, f"launched Terminal command file {command_file}", input_file
-    subprocess.Popen(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    return True, "launched detached with --input-file", input_file
+        mode = "fresh" if fresh else "resume"
+        return True, f"launched {mode} Terminal command file {command_file}", input_file
+    env = os.environ.copy()
+    if qwen_real_bin:
+        env["QWEN_REAL_BIN"] = str(expand_path(qwen_real_bin))
+    subprocess.Popen(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=env)
+    mode = "fresh" if fresh else "resume"
+    return True, f"launched {mode} detached with --input-file", input_file
+
+
+def candidate_message(candidate: SessionCandidate, cfg: dict[str, Any], fresh: bool) -> str:
+    base = str(cfg_get(cfg, "qwen.message", "Dale papito segui"))
+    if not fresh:
+        return base
+    context = (
+        f"{base}\n\n"
+        f"No pude usar --resume para la sesion {candidate.session_id} porque el historial viejo rompe el backend "
+        "con 'System message must be at the beginning'. Arranca fresco en este mismo directorio y reconstruye "
+        "el contexto desde el repo y estos ultimos datos.\n"
+        f"Directorio: {candidate.cwd}\n"
+        f"Ultimo pedido del usuario: {candidate.last_user[:900]}\n"
+        f"Ultima respuesta del agente anterior: {candidate.last_assistant[:900]}\n"
+    )
+    return context
 
 
 def control_candidate(candidate: SessionCandidate, cfg: dict[str, Any], dry_run: bool) -> str:
-    message = str(cfg_get(cfg, "qwen.message", "Dale papito segui"))
-    input_file = Path(candidate.input_file) if candidate.input_file else None
+    fresh = candidate.reason == "resume history incompatible" and bool(cfg_get(cfg, "qwen.fresh_on_history_error", True))
+    message = candidate_message(candidate, cfg, fresh)
+    input_file = None if fresh else (Path(candidate.input_file) if candidate.input_file else None)
     action = ""
+    launched = False
     if input_file:
         action = f"use existing input_file {input_file}"
     else:
-        ok, detail, input_file = launch_qwen(candidate, cfg, dry_run)
+        ok, detail, input_file = launch_qwen(candidate, cfg, dry_run, fresh=fresh)
         action = detail
         if not ok:
             return f"{candidate.session_id}: failed: {detail}"
+        launched = True
     if dry_run:
         return f"{candidate.session_id}: dry-run would submit to {input_file}; {action}"
+    if launched:
+        time.sleep(float(cfg_get(cfg, "qwen.input_ready_delay", 5)))
     jsonl_append(input_file, {"type": "submit", "text": message})
     return f"{candidate.session_id}: submitted remote input; {action}"
 
