@@ -48,7 +48,10 @@ def log(msg: str) -> None:
 
 
 def run(cmd: list[str], timeout: int = 30, check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=check)
+    try:
+        return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=check)
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(cmd, 124, exc.stdout or "", exc.stderr or "timeout")
 
 
 def redact_args(args: str) -> str:
@@ -396,7 +399,7 @@ def shell_quote_cmd(parts: list[str]) -> str:
 def launch_qwen(candidate: SessionCandidate, cfg: dict[str, Any], dry_run: bool) -> tuple[bool, str, Path]:
     input_dir = expand_path(cfg_get(cfg, "qwen.input_dir", str(INPUT_DIR_DEFAULT)))
     input_file = input_dir / f"{candidate.session_id}.jsonl"
-    qwen_cmd = str(cfg_get(cfg, "qwen.command", "qwen"))
+    qwen_cmd = str(expand_path(cfg_get(cfg, "qwen.command", str(HOME / ".local" / "bin" / "qwen"))))
     args = [qwen_cmd, "--resume", candidate.session_id, "--input-file", str(input_file)]
     if bool(cfg_get(cfg, "qwen.yolo", True)):
         args.append("--yolo")
@@ -408,7 +411,7 @@ def launch_qwen(candidate: SessionCandidate, cfg: dict[str, Any], dry_run: bool)
     if platform.system() == "Darwin" and bool(cfg_get(cfg, "qwen.launch_terminal_on_macos", True)):
         script = f"cd {shlex.quote(cwd)} && {shell_quote_cmd(args)}"
         osa = f'tell application "Terminal" to do script {json.dumps(script)}'
-        proc = run(["osascript", "-e", osa], timeout=10)
+        proc = run(["osascript", "-e", osa], timeout=30)
         if proc.returncode != 0:
             return False, f"Terminal launch failed: {proc.stderr.strip()}", input_file
         return True, "launched in Terminal with --input-file", input_file
@@ -439,7 +442,14 @@ def round_robin(cfg: dict[str, Any], force: bool, dry_run: bool) -> list[str]:
         log(f"capacity: {detail}")
         if not ok:
             return [f"capacity not available: {detail}"]
-    candidates = [s for s in discover_sessions(cfg, include_all_recent=True) if s.reason != "active-or-complete"]
+    restart_running = bool(cfg_get(cfg, "qwen.restart_running_without_input_file", False))
+    candidates = []
+    for session in discover_sessions(cfg, include_all_recent=True):
+        if session.reason == "active-or-complete":
+            continue
+        if session.running and not session.input_file and not restart_running:
+            continue
+        candidates.append(session)
     if not candidates:
         return ["no stuck/stale sessions found"]
     state = load_state()
