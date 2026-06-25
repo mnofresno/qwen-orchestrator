@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""qwen-orchestrator: GPU-aware Qwen Code session manager."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import shlex
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib import request, error
+
+HOME = Path.home()
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = REPO_ROOT / "config" / "config.example.yaml"
+USER_CONFIG = HOME / ".config" / "qwen-orchestrator" / "config.yaml"
+DATA_DIR = HOME / ".local" / "share" / "qwen-orchestrator"
+INPUT_DIR_DEFAULT = DATA_DIR / "input"
+LOG_FILE = DATA_DIR / "orchestrator.log"
+STATE_FILE = DATA_DIR / "state.json"
+QWEN_DIR = HOME / ".qwen"
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+ERROR_RE = re.compile(r"request timeout|api error|timeout|rate limit|overloaded|try reducing", re.I)
+DONE_RE = re.compile(
+    r"complete|completed|done|final|pushed|pusheado|sincronizado|everything up-to-date|"
+    r"created pull request|opened.*pr|merged|todo completado|tareas completadas|checks pass|"
+    r"all checks.*pass|ya estaba sincronizado",
+    re.I,
+)
+SECRET_RE = re.compile(
+    r"(sk-[A-Za-z0-9_-]+|gh[opsu]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|Bearer\s+[A-Za-z0-9._-]+)",
+    re.I,
+)
+
+
+def log(msg: str) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    with LOG_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def run(cmd: list[str], timeout: int = 30, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=check)
+
+
+def redact_args(args: str) -> str:
+    args = re.sub(r"(--openai-api-key\s+)\S+", r"\1<redacted>", args)
+    args = re.sub(r"(OPENAI_API_KEY=)\S+", r"\1<redacted>", args)
+    return args
+
+
+def redact_text(text: str) -> str:
+    return SECRET_RE.sub("<redacted>", text)
+
+
+def parse_scalar(value: str) -> Any:
+    value = value.strip().strip('"').strip("'")
+    low = value.lower()
+    if low in {"true", "yes", "on"}:
+        return True
+    if low in {"false", "no", "off"}:
+        return False
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        return float(value)
+    return value
+
+
+def load_simple_yaml(path: Path) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    stack: list[tuple[int, dict[str, Any]]] = [(-1, data)]
+    if not path.exists():
+        return data
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip() or ":" not in line:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        key, value = line.strip().split(":", 1)
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        if value.strip() == "":
+            child: dict[str, Any] = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = parse_scalar(value)
+    return data
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def cfg_get(cfg: dict[str, Any], path: str, default: Any = None) -> Any:
+    cur: Any = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
+
+
+def load_config() -> dict[str, Any]:
+    cfg = load_simple_yaml(DEFAULT_CONFIG)
+    if USER_CONFIG.exists():
+        cfg = deep_merge(cfg, load_simple_yaml(USER_CONFIG))
+    return cfg
+
+
+def expand_path(value: str | Path) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(str(value))))
+
+
+def load_state() -> dict[str, Any]:
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(state: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+@dataclass
+class QwenProcess:
+    pid: int
+    ppid: int
+    tty: str
+    state: str
+    args: str
+    cwd: str | None
+    session_id: str | None
+    input_file: str | None
+
+
+@dataclass
+class SessionCandidate:
+    session_id: str
+    chat_path: Path
+    project_dir: Path
+    cwd: str
+    reason: str
+    last_user: str
+    last_assistant: str
+    running: QwenProcess | None
+    input_file: str | None
+    mtime: float
+
+
+def project_key_from_cwd(cwd: str) -> str:
+    # Qwen stores project paths as a filesystem-safe slug:
+    # /Users/mariano.fresno/bpf-groups-bridge -> -Users-mariano-fresno-bpf-groups-bridge
+    return re.sub(r"[^A-Za-z0-9]+", "-", cwd.rstrip("/")) or "-"
+
+
+def cwd_from_project_key(key: str) -> str:
+    home_key = project_key_from_cwd(str(HOME))
+    if key == home_key:
+        return str(HOME)
+    if key.startswith(home_key + "-"):
+        # Most local Qwen projects here are direct children of HOME. This avoids
+        # corrupting repository names that legitimately contain hyphens.
+        candidate = HOME / key[len(home_key) + 1 :]
+        if candidate.exists():
+            return str(candidate)
+    return str(HOME)
+
+
+def process_cwd(pid: int) -> str | None:
+    if platform.system() == "Darwin":
+        proc = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], timeout=5)
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if line.startswith("n/"):
+                    return line[1:]
+        return None
+    link = Path("/proc") / str(pid) / "cwd"
+    try:
+        return str(link.resolve())
+    except Exception:
+        return None
+
+
+def ps_qwen_processes() -> list[QwenProcess]:
+    proc = run(["ps", "-axo", "pid=,ppid=,tty=,state=,command="], timeout=10)
+    rows: list[QwenProcess] = []
+    if proc.returncode != 0:
+        return rows
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 4)
+        if len(parts) < 5:
+            continue
+        pid_s, ppid_s, tty, state, args = parts
+        if "/qwen-code/" not in args or "/lib/cli.js" not in args:
+            continue
+        if "grep" in args:
+            continue
+        sid = None
+        match = re.search(r"(?:--resume|-r)\s+([0-9a-f-]{36})", args)
+        if match:
+            sid = match.group(1)
+        input_file = None
+        match = re.search(r"--input-file\s+(\S+)", args)
+        if match:
+            input_file = match.group(1).strip("'\"")
+        pid = int(pid_s)
+        rows.append(QwenProcess(pid, int(ppid_s), tty, state, args, process_cwd(pid), sid, input_file))
+    qwen_pids = {p.pid for p in rows}
+    leaves = [p for p in rows if p.pid not in {x.ppid for x in rows if x.ppid in qwen_pids}]
+    return sorted(leaves or rows, key=lambda p: (p.tty, p.pid))
+
+
+def session_from_process(proc: QwenProcess) -> str | None:
+    if proc.session_id:
+        return proc.session_id
+    if proc.cwd:
+        chat_dir = QWEN_DIR / "projects" / project_key_from_cwd(proc.cwd) / "chats"
+        chats = sorted(chat_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if chats:
+            return chats[0].stem
+    return None
+
+
+def read_recent_jsonl(path: Path, limit: int = 80) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def text_from_event(ev: dict[str, Any]) -> str:
+    parts = ev.get("message", {}).get("parts", [])
+    texts: list[str] = []
+    for part in parts:
+        if isinstance(part, dict):
+            if isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            elif "functionResponse" in part:
+                resp = part.get("functionResponse", {}).get("response", {})
+                if isinstance(resp, dict) and isinstance(resp.get("output"), str):
+                    texts.append(resp["output"])
+    return redact_text(" ".join(t.replace("\n", " ") for t in texts).strip())
+
+
+def summarize_chat(path: Path, stale_minutes: int) -> tuple[str, str, str]:
+    events = read_recent_jsonl(path)
+    last_user = ""
+    last_assistant = ""
+    combined_recent: list[str] = []
+    for ev in events:
+        text = text_from_event(ev)
+        if not text:
+            continue
+        combined_recent.append(text)
+        typ = ev.get("type")
+        role = ev.get("message", {}).get("role")
+        if typ == "user" or role == "user":
+            last_user = text[:500]
+        if typ == "assistant" or role in {"assistant", "model"}:
+            last_assistant = text[:500]
+    recent_tail = "\n".join(combined_recent[-4:])
+    age_min = (time.time() - path.stat().st_mtime) / 60
+    if DONE_RE.search(last_assistant) or re.fullmatch(r"(?i)\s*(ok\s*)?fin\s*", last_user or ""):
+        reason = "active-or-complete"
+    elif ERROR_RE.search(recent_tail):
+        reason = "recent API/timeout error"
+    elif age_min >= stale_minutes and last_user and not DONE_RE.search(last_assistant):
+        reason = f"stale {int(age_min)}m after user request"
+    else:
+        reason = "active-or-complete"
+    return reason, last_user, last_assistant
+
+
+def discover_sessions(cfg: dict[str, Any], include_all_recent: bool = False) -> list[SessionCandidate]:
+    stale = int(cfg_get(cfg, "qwen.stale_minutes", 45))
+    running = ps_qwen_processes()
+    by_sid: dict[str, QwenProcess] = {}
+    for proc in running:
+        sid = session_from_process(proc)
+        if sid:
+            proc.session_id = sid
+            by_sid[sid] = proc
+    paths: dict[str, Path] = {}
+    for sid in by_sid:
+        found = list(QWEN_DIR.glob(f"projects/*/chats/{sid}.jsonl"))
+        if found:
+            paths[sid] = found[0]
+    recent_chats = sorted(QWEN_DIR.glob("projects/*/chats/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    max_recent = int(cfg_get(cfg, "qwen.audit_recent", 40))
+    for path in recent_chats[:max_recent]:
+        if include_all_recent or path.stem in by_sid:
+            paths.setdefault(path.stem, path)
+    out: list[SessionCandidate] = []
+    for sid, path in paths.items():
+        reason, last_user, last_assistant = summarize_chat(path, stale)
+        proc = by_sid.get(sid)
+        if include_all_recent or proc or reason != "active-or-complete":
+            project_dir = path.parents[1]
+            cwd = proc.cwd if proc and proc.cwd else cwd_from_project_key(project_dir.name)
+            out.append(SessionCandidate(sid, path, project_dir, cwd, reason, last_user, last_assistant, proc, proc.input_file if proc else None, path.stat().st_mtime))
+    return sorted(out, key=lambda s: (s.reason == "active-or-complete", -s.mtime))
+
+
+def check_gpu_ssh(cfg: dict[str, Any]) -> tuple[bool, str]:
+    host = str(cfg_get(cfg, "ssh.host", "192.168.1.58"))
+    user = str(cfg_get(cfg, "ssh.user", "mariano"))
+    key = expand_path(str(cfg_get(cfg, "ssh.key", "~/.ssh/id_rsa_dell_precision")))
+    timeout = int(cfg_get(cfg, "ssh.timeout", 10))
+    threshold = float(cfg_get(cfg, "gpu.threshold", 30))
+    cmd = ["ssh", "-i", str(key), "-o", "StrictHostKeyChecking=no", "-o", f"ConnectTimeout={timeout}", f"{user}@{host}", "nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits"]
+    proc = run(cmd, timeout=timeout + 5)
+    if proc.returncode != 0:
+        return False, f"ssh failed: {proc.stderr.strip() or proc.stdout.strip()}"
+    vals = [float(x.strip()) for x in proc.stdout.splitlines() if x.strip().replace(".", "", 1).isdigit()]
+    if not vals:
+        return False, "ssh returned no GPU values"
+    avg = sum(vals) / len(vals)
+    return avg <= threshold, f"ssh avg_gpu={avg:.1f}% threshold={threshold:g}"
+
+
+def check_gpu_grafana(cfg: dict[str, Any]) -> tuple[bool, str]:
+    strategy = str(cfg_get(cfg, "strategy", "grafana-llm"))
+    url = str(cfg_get(cfg, "grafana.url", "https://grafana-ai.fresno.ar")).rstrip("/")
+    api_key = str(cfg_get(cfg, "grafana.api_key", ""))
+    if not api_key or "XXX" in api_key:
+        return False, "grafana api_key is not configured"
+    if strategy == "grafana-power":
+        query = str(cfg_get(cfg, "grafana.power_query", "sum(DCGM_FI_DEV_POWER_USAGE)"))
+        threshold = float(cfg_get(cfg, "grafana.power_threshold", 100))
+    else:
+        query = str(cfg_get(cfg, "grafana.llm_query", "sum(vllm:num_requests_running) or vector(0)"))
+        threshold = float(cfg_get(cfg, "grafana.llm_threshold", 1))
+    payload = json.dumps({"queries": [{"datasourceUid": str(cfg_get(cfg, "grafana.datasource_uid", "prometheus-scrapper")), "expr": query, "refId": "A", "queryType": "instant"}]}).encode()
+    req = request.Request(f"{url}/api/ds/query", data=payload, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    try:
+        with request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode())
+    except (error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return False, f"grafana query failed: {exc}"
+    nums = [float(x) for x in re.findall(r'"values"\s*:\s*\[\s*([0-9.]+)', json.dumps(body))]
+    if not nums:
+        nums = [float(x) for x in re.findall(r'"value"\s*:\s*\[[^\]]*,\s*"?([0-9.]+)"?', json.dumps(body))]
+    if not nums:
+        return False, "grafana returned no numeric value"
+    value = nums[0]
+    return value <= threshold, f"{strategy} value={value:g} threshold={threshold:g}"
+
+
+def capacity_ok(cfg: dict[str, Any]) -> tuple[bool, str]:
+    strategy = str(cfg_get(cfg, "strategy", "grafana-llm"))
+    if strategy == "ssh":
+        return check_gpu_ssh(cfg)
+    if strategy.startswith("grafana"):
+        return check_gpu_grafana(cfg)
+    return False, f"unknown strategy: {strategy}"
+
+
+def jsonl_append(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def shell_quote_cmd(parts: list[str]) -> str:
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def launch_qwen(candidate: SessionCandidate, cfg: dict[str, Any], dry_run: bool) -> tuple[bool, str, Path]:
+    input_dir = expand_path(cfg_get(cfg, "qwen.input_dir", str(INPUT_DIR_DEFAULT)))
+    input_file = input_dir / f"{candidate.session_id}.jsonl"
+    qwen_cmd = str(cfg_get(cfg, "qwen.command", "qwen"))
+    args = [qwen_cmd, "--resume", candidate.session_id, "--input-file", str(input_file)]
+    if bool(cfg_get(cfg, "qwen.yolo", True)):
+        args.append("--yolo")
+    cwd = candidate.cwd if Path(candidate.cwd).exists() else str(HOME)
+    if dry_run:
+        return True, f"dry-run launch: cd {cwd} && {shell_quote_cmd(args)}", input_file
+    input_file.parent.mkdir(parents=True, exist_ok=True)
+    input_file.touch(exist_ok=True)
+    if platform.system() == "Darwin" and bool(cfg_get(cfg, "qwen.launch_terminal_on_macos", True)):
+        script = f"cd {shlex.quote(cwd)} && {shell_quote_cmd(args)}"
+        osa = f'tell application "Terminal" to do script {json.dumps(script)}'
+        proc = run(["osascript", "-e", osa], timeout=10)
+        if proc.returncode != 0:
+            return False, f"Terminal launch failed: {proc.stderr.strip()}", input_file
+        return True, "launched in Terminal with --input-file", input_file
+    subprocess.Popen(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return True, "launched detached with --input-file", input_file
+
+
+def control_candidate(candidate: SessionCandidate, cfg: dict[str, Any], dry_run: bool) -> str:
+    message = str(cfg_get(cfg, "qwen.message", "Dale papito segui"))
+    input_file = Path(candidate.input_file) if candidate.input_file else None
+    action = ""
+    if input_file:
+        action = f"use existing input_file {input_file}"
+    else:
+        ok, detail, input_file = launch_qwen(candidate, cfg, dry_run)
+        action = detail
+        if not ok:
+            return f"{candidate.session_id}: failed: {detail}"
+    if dry_run:
+        return f"{candidate.session_id}: dry-run would submit to {input_file}; {action}"
+    jsonl_append(input_file, {"type": "submit", "text": message})
+    return f"{candidate.session_id}: submitted remote input; {action}"
+
+
+def round_robin(cfg: dict[str, Any], force: bool, dry_run: bool) -> list[str]:
+    if not force:
+        ok, detail = capacity_ok(cfg)
+        log(f"capacity: {detail}")
+        if not ok:
+            return [f"capacity not available: {detail}"]
+    candidates = [s for s in discover_sessions(cfg, include_all_recent=True) if s.reason != "active-or-complete"]
+    if not candidates:
+        return ["no stuck/stale sessions found"]
+    state = load_state()
+    idx = int(state.get("round_robin_index", 0)) % len(candidates)
+    limit = int(cfg_get(cfg, "qwen.max_sessions_per_cycle", 1))
+    ordered = candidates[idx:] + candidates[:idx]
+    selected = ordered[:limit]
+    results = [control_candidate(s, cfg, dry_run) for s in selected]
+    state["round_robin_index"] = (idx + len(selected)) % len(candidates)
+    if not dry_run:
+        save_state(state)
+    return results
+
+
+def auto_push(cfg: dict[str, Any], dry_run: bool) -> str | None:
+    if not bool(cfg_get(cfg, "auto_push.enabled", False)):
+        return None
+    repo = expand_path(cfg_get(cfg, "auto_push.repo", str(REPO_ROOT)))
+    if not (repo / ".git").exists():
+        return None
+    interval = int(cfg_get(cfg, "auto_push.interval", 3600))
+    state = load_state()
+    now = int(time.time())
+    if now - int(state.get("last_push", 0)) < interval:
+        return None
+    status = run(["git", "-C", str(repo), "status", "--porcelain"], timeout=10)
+    if not status.stdout.strip():
+        state["last_push"] = now
+        if not dry_run:
+            save_state(state)
+        return "auto_push: no changes"
+    if dry_run:
+        return "auto_push: dry-run would commit and push"
+    run(["git", "-C", str(repo), "add", "-A"], timeout=30, check=True)
+    msg = f"orchestrator: auto update {time.strftime('%Y-%m-%d %H:%M')}"
+    commit = run(["git", "-C", str(repo), "commit", "-m", msg], timeout=60)
+    if commit.returncode != 0:
+        return f"auto_push: commit failed: {commit.stderr.strip()}"
+    push = run(["git", "-C", str(repo), "push", "-u", "origin", "HEAD"], timeout=120)
+    state["last_push"] = now
+    save_state(state)
+    return "auto_push: pushed" if push.returncode == 0 else f"auto_push: push failed: {push.stderr.strip()}"
+
+
+def print_audit(cfg: dict[str, Any]) -> None:
+    sessions = discover_sessions(cfg, include_all_recent=True)
+    print(f"Found {len(sessions)} recent/running Qwen sessions")
+    for s in sessions[: int(cfg_get(cfg, "qwen.audit_recent", 40))]:
+        status = "running" if s.running else "stopped"
+        control = "input-file" if s.input_file else "restart-needed"
+        age = int((time.time() - s.mtime) / 60)
+        print(f"- {s.session_id} [{status}, {control}, {age}m] {s.reason}")
+        print(f"  cwd: {s.cwd}")
+        if s.running:
+            print(f"  pid: {s.running.pid} tty: {s.running.tty} state: {s.running.state}")
+        if s.last_user:
+            print(f"  last_user: {s.last_user[:220]}")
+        if s.last_assistant:
+            print(f"  last_assistant: {s.last_assistant[:220]}")
+
+
+def print_status(cfg: dict[str, Any]) -> None:
+    ok, detail = capacity_ok(cfg)
+    print(f"strategy: {cfg_get(cfg, 'strategy', 'grafana-llm')}")
+    print(f"capacity: {'ok' if ok else 'not-ok'} ({detail})")
+    procs = ps_qwen_processes()
+    print(f"running_qwen_processes: {len(procs)}")
+    for proc in procs:
+        sid = session_from_process(proc) or "unknown"
+        control = proc.input_file or "no-input-file"
+        print(f"- pid={proc.pid} tty={proc.tty} state={proc.state} session={sid} control={control} cwd={proc.cwd or 'unknown'}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="GPU-aware Qwen Code session manager")
+    parser.add_argument("command", nargs="?", default="daemon", choices=["daemon", "status", "audit", "once", "round-robin", "resume", "help"])
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true", help="skip capacity gate")
+    args = parser.parse_args()
+    if args.command == "help":
+        parser.print_help()
+        return 0
+    cfg = load_config()
+    if args.command == "status":
+        print_status(cfg)
+        return 0
+    if args.command == "audit":
+        print_audit(cfg)
+        return 0
+    if args.command in {"once", "round-robin", "resume"}:
+        for line in round_robin(cfg, force=args.force or args.command == "resume", dry_run=args.dry_run):
+            log(line)
+        pushed = auto_push(cfg, args.dry_run)
+        if pushed:
+            log(pushed)
+        return 0
+    interval = int(cfg_get(cfg, "gpu.poll_interval", 300))
+    log(f"starting daemon interval={interval}s")
+    while True:
+        for line in round_robin(cfg, force=False, dry_run=bool(cfg_get(cfg, "qwen.dry_run", False))):
+            log(line)
+        pushed = auto_push(cfg, False)
+        if pushed:
+            log(pushed)
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

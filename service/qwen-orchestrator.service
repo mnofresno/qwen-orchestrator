@@ -1,0 +1,14 @@
+[Unit]
+Description=Qwen Orchestrator - GPU monitor and session resume service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/qwen-orchestrator/bin/qwen-orchestrator
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

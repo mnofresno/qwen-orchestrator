@@ -1,0 +1,50 @@
+# Qwen Orchestrator Configuration
+# Copy to ~/.config/qwen-orchestrator/config.yaml and edit
+#
+# Strategy determines how GPU/capacity load is checked.
+# Options: ssh, grafana-llm, grafana-power
+
+strategy: grafana-llm
+
+# --- SSH strategy (nvidia-smi via SSH) ---
+ssh:
+  host: 192.168.1.58
+  user: mariano
+  key: ~/.ssh/id_rsa_dell_precision
+  timeout: 10
+
+# --- Grafana strategies ---
+grafana:
+  url: https://grafana-ai.fresno.ar
+  api_key: gls_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+  # grafana-llm strategy: checks vLLM running requests
+  llm_query: "sum(vllm:num_requests_running) or vector(0)"
+  llm_threshold: 1
+  # grafana-power strategy: checks GPU power draw
+  power_query: "sum(DCGM_FI_DEV_POWER_USAGE{instance=~\"nvidia_dcgm_exporter:9400\"})"
+  power_threshold: 100
+
+# --- Fallback SSH threshold (only if strategy: ssh) ---
+gpu:
+  threshold: 30
+  poll_interval: 300
+
+# --- Qwen control behavior ---
+qwen:
+  # Sent through --input-file JSONL. Keep this blunt: resumed agents should
+  # continue the original task, validate, commit, and push when appropriate.
+  message: "Dale papito segui. Retoma la tarea pendiente, valida con evidencia concreta y si hay cambios listos hace commit y push."
+  command: qwen
+  yolo: true
+  stale_minutes: 45
+  audit_recent: 40
+  max_sessions_per_cycle: 1
+  input_dir: ~/.local/share/qwen-orchestrator/input
+  launch_terminal_on_macos: true
+  dry_run: false
+
+# --- Auto-push config changes to this repo ---
+auto_push:
+  enabled: true
+  interval: 3600
+  repo: ~/qwen-orchestrator
